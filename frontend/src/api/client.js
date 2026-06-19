@@ -1,123 +1,107 @@
-import client from "./client";
+import axios from "axios";
 
-// ---------------------------------------------------------------------------
-// Auth
-// ---------------------------------------------------------------------------
-export const authApi = {
-  login: (username, password) => client.post("/auth/login/", { username, password }),
-  refresh: (refresh) => client.post("/auth/refresh/", { refresh }),
-  me: () => client.get("/auth/me/"),
-};
+export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api";
 
-// ---------------------------------------------------------------------------
-// Lookup / catalogue
-// ---------------------------------------------------------------------------
-export const consultationTypesApi = {
-  list: (params) => client.get("/consultation-types/", { params }),
-  create: (data) => client.post("/consultation-types/", data),
-  update: (id, data) => client.patch(`/consultation-types/${id}/`, data),
-  remove: (id) => client.delete(`/consultation-types/${id}/`),
-};
+const client = axios.create({
+  baseURL: API_BASE_URL,
+});
 
-export const icd10Api = {
-  list: (params) => client.get("/icd10-codes/", { params }),
-  create: (data) => client.post("/icd10-codes/", data),
-  update: (id, data) => client.patch(`/icd10-codes/${id}/`, data),
-  remove: (id) => client.delete(`/icd10-codes/${id}/`),
-};
+function getTokens() {
+  return {
+    access: localStorage.getItem("hms_access"),
+    refresh: localStorage.getItem("hms_refresh"),
+  };
+}
 
-export const diagnosisNotesApi = {
-  list: (params) => client.get("/diagnosis-notes/", { params }),
-  create: (data) => client.post("/diagnosis-notes/", data),
-  update: (id, data) => client.patch(`/diagnosis-notes/${id}/`, data),
-  remove: (id) => client.delete(`/diagnosis-notes/${id}/`),
-};
+export function setTokens({ access, refresh }) {
+  if (access) localStorage.setItem("hms_access", access);
+  if (refresh) localStorage.setItem("hms_refresh", refresh);
+}
 
-export const medicinesApi = {
-  list: (params) => client.get("/medicines/", { params }),
-  lowStock: () => client.get("/medicines/low_stock/"),
-  create: (data) => client.post("/medicines/", data),
-  update: (id, data) => client.patch(`/medicines/${id}/`, data),
-  remove: (id) => client.delete(`/medicines/${id}/`),
-};
+export function clearTokens() {
+  localStorage.removeItem("hms_access");
+  localStorage.removeItem("hms_refresh");
+  localStorage.removeItem("hms_user");
+}
 
-// ---------------------------------------------------------------------------
-// Users (admin)
-// ---------------------------------------------------------------------------
-export const usersApi = {
-  list: (params) => client.get("/users/", { params }),
-  create: (data) => client.post("/users/", data),
-  update: (id, data) => client.patch(`/users/${id}/`, data),
-  remove: (id) => client.delete(`/users/${id}/`),
-};
+client.interceptors.request.use((config) => {
+  const { access } = getTokens();
+  if (access) {
+    config.headers.Authorization = `Bearer ${access}`;
+  }
+  return config;
+});
 
-// ---------------------------------------------------------------------------
-// Patients
-// ---------------------------------------------------------------------------
-export const patientsApi = {
-  list: (params) => client.get("/patients/", { params }),
-  get: (id) => client.get(`/patients/${id}/`),
-  create: (data) => client.post("/patients/", data),
-  update: (id, data) => client.patch(`/patients/${id}/`, data),
-};
+let isRefreshing = false;
+let pendingQueue = [];
 
-// ---------------------------------------------------------------------------
-// Visits
-// ---------------------------------------------------------------------------
-export const visitsApi = {
-  list: (params) => client.get("/visits/", { params }),
-  get: (id) => client.get(`/visits/${id}/`),
-  create: (data) => client.post("/visits/", data),
-  queue: () => client.get("/visits/queue/"),
-  billingReady: () => client.get("/visits/billing_ready/"),
-};
+function processQueue(error, token = null) {
+  pendingQueue.forEach(({ resolve, reject }) => {
+    if (error) reject(error);
+    else resolve(token);
+  });
+  pendingQueue = [];
+}
 
-// ---------------------------------------------------------------------------
-// Triage
-// ---------------------------------------------------------------------------
-export const triageApi = {
-  create: (data) => client.post("/triages/", data),
-};
+client.interceptors.response.use(
+  (response) => response,
+  async (error) => {
+    const originalRequest = error.config;
 
-// ---------------------------------------------------------------------------
-// Consultations
-// ---------------------------------------------------------------------------
-export const consultationsApi = {
-  list: (params) => client.get("/consultations/", { params }),
-  get: (id) => client.get(`/consultations/${id}/`),
-  create: (data) => client.post("/consultations/", data),
-  update: (id, data) => client.patch(`/consultations/${id}/`, data),
-  complete: (id) => client.post(`/consultations/${id}/complete/`),
-};
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      const { refresh } = getTokens();
 
-export const consultationNotesApi = {
-  create: (data) => client.post("/consultation-notes/", data),
-  remove: (id) => client.delete(`/consultation-notes/${id}/`),
-};
+      if (!refresh) {
+        clearTokens();
+        window.location.href = "/login";
+        return Promise.reject(error);
+      }
 
-export const prescriptionsApi = {
-  create: (data) => client.post("/prescriptions/", data),
-  dispense: (id) => client.post(`/prescriptions/${id}/dispense/`),
-};
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => {
+          pendingQueue.push({ resolve, reject });
+        })
+          .then((token) => {
+            originalRequest.headers.Authorization = `Bearer ${token}`;
+            return client(originalRequest);
+          })
+          .catch((err) => Promise.reject(err));
+      }
 
-// ---------------------------------------------------------------------------
-// Payments / Walk-in sales
-// ---------------------------------------------------------------------------
-export const paymentsApi = {
-  create: (data) => client.post("/payments/", data),
-  list: (params) => client.get("/payments/", { params }),
-};
+      originalRequest._retry = true;
+      isRefreshing = true;
 
-export const walkInSalesApi = {
-  list: (params) => client.get("/walkin-sales/", { params }),
-  create: (data) => client.post("/walkin-sales/", data),
-};
+      try {
+        const res = await axios.post(`${API_BASE_URL}/auth/refresh/`, { refresh });
+        const newAccess = res.data.access;
+        setTokens({ access: newAccess });
+        processQueue(null, newAccess);
+        originalRequest.headers.Authorization = `Bearer ${newAccess}`;
+        return client(originalRequest);
+      } catch (refreshError) {
+        processQueue(refreshError, null);
+        clearTokens();
+        window.location.href = "/login";
+        return Promise.reject(refreshError);
+      } finally {
+        isRefreshing = false;
+      }
+    }
 
-// ---------------------------------------------------------------------------
-// Analytics
-// ---------------------------------------------------------------------------
-export const analyticsApi = {
-  admin: (days = 14) => client.get("/analytics/admin/", { params: { days } }),
-  doctor: (days = 14) => client.get("/analytics/doctor/", { params: { days } }),
-  nurse: (days = 14) => client.get("/analytics/nurse/", { params: { days } }),
-};
+    return Promise.reject(error);
+  }
+);
+
+/**
+ * Normalizes DRF paginated responses ({ count, results: [] }) into a plain
+ * array, while also supporting endpoints that already return a plain array.
+ * Use this around any list-fetching call to avoid the recurring
+ * "results.map is not a function" bug.
+ */
+export function unwrapList(data) {
+  if (Array.isArray(data)) return data;
+  if (data && Array.isArray(data.results)) return data.results;
+  return [];
+}
+
+export default client;
